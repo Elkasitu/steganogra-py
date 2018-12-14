@@ -1,3 +1,6 @@
+import numpy as np
+import pygame
+import zlib
 
 
 class PNGChunk:
@@ -96,6 +99,9 @@ class PNGDecoder:
             chunk = self.get_next_chunk()
             parsed = self._parse_chunk(chunk)
 
+    def inflate(self):
+        self.image.data = zlib.decompress(self.image.data)
+
 
 class PNGImage:
 
@@ -109,6 +115,19 @@ class PNGImage:
         self.int_method = int_method
         self.palette = None
         self.data = b''
+        self._bitmap = []
+
+    @property
+    def bitmap(self):
+        while len(self._bitmap) < self.height:
+            buffer = []
+            i = 0
+            while len(buffer) < self.width:
+                r, g, b = self.data[i:i + 3]
+                buffer.append(np.array([r, g, b]))
+                i += 3
+            self._bitmap.append(np.array(buffer))
+        return np.array(self._bitmap)
 
 
 if __name__ == '__main__':
@@ -118,5 +137,11 @@ if __name__ == '__main__':
 
     d = PNGDecoder(buf)
     d.decode()
-    print(d.image.width, d.image.height, d.image.depth, d.image.color_type, d.image.cmp_method,
-          d.image.filter_method, d.image.int_method, d.image.palette)
+    d.inflate()
+    img = d.image
+    pygame.init()
+    screen = pygame.display.set_mode((img.width, img.height))
+    pygame.surfarray.blit_array(screen, img.bitmap)
+    pygame.display.flip()
+    while True:
+        pass
