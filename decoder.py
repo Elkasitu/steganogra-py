@@ -1,6 +1,9 @@
+import math
 import numpy as np
 import pygame
 import zlib
+
+from collections import defaultdict
 
 
 class PNGChunk:
@@ -102,8 +105,89 @@ class PNGDecoder:
     def inflate(self):
         self.image.data = zlib.decompress(self.image.data)
 
+    def _paeth_predictor(self, a, b, c):
+        p = a + b - c
+        pa = abs(p - a)
+        pb = abs(p - b)
+        pc = abs(p - c)
+
+        if pa <= pb and pa <= pc:
+            return a
+        elif pb <= pc:
+            return b
+        return c
+
+    def defilter(self):
+        buffer = b''
+        for y, scanline in enumerate(list(self.image.scanlines.values())):
+            filter_type = scanline[0]
+            scanline = scanline[1:]
+            if filter_type == 0:
+                # do nothing except remove the filter_type byte
+                defiltered = scanline
+            elif filter_type == 1:
+                # sub filtering
+                defiltered = b''
+                for x, byte in enumerate(scanline):
+                    if x - self.image.bpp < 0:
+                        sub = 0
+                    else:
+                        sub = defiltered[x - self.image.bpp]
+                    defiltered += hex((byte + sub) % 256)
+            elif filter_type == 2:
+                # up filtering
+                defiltered = b''
+                for x, byte in enumerate(scanline):
+                    if y == 0:
+                        up = 0
+                    else:
+                        up = scanlines[y - 1][x]
+                    defiltered += hex((byte + up) % 256)
+            elif filter_type == 3:
+                # average filtering
+                defiltered = b''
+                for x, byte in enumerate(scanline):
+                    if x - self.image.bpp < 0:
+                        sub = 0
+                    else:
+                        sub = defiltered[x - self.image.bpp]
+                    if y == 0:
+                        up = 0
+                    else:
+                        up = scanlines[y - 1][x]
+                    defiltered += hex((byte + math.floor((sub + up) / 2)) % 256)
+            elif filter_type == 4:
+                # paeth filtering
+                defiltered = b''
+                for x, byte in enumerate(scanline):
+                    if x - self.image.bpp < 0:
+                        sub = 0
+                        diag = 0
+                    else:
+                        sub = defiltered[x - self.image.bpp]
+                        if y == 0:
+                            up = 0
+                            diag = 0
+                        else:
+                            up = scanlines[y - 1][x]
+                            diag = scanlines[y - 1][x - self.image.bpp]
+                    defiltered += hex((byte + self._paeth_predictor(sub, up, diag)) % 256)
+            else:
+                defiltered = b''
+                print("Unknown filter type for scanline %d" % y)
+            buffer += defiltered
+        self.image.data = buffer
+
 
 class PNGImage:
+
+    TYPE_MULTIPLIER = {
+            0: 1, # grayscale
+            2: 3, # truecolor
+            3: 1, # indexed/palette
+            4: 2, # grayscale + alpha
+            6: 3, # truecolor + alpha
+        }
 
     def __init__(self, width, height, depth, color_type, cmp_method, filter_method, int_method):
         self.width = width
@@ -116,6 +200,9 @@ class PNGImage:
         self.palette = None
         self.data = b''
         self._bitmap = []
+        self._scanlines = []
+        # depth is in bits but bytes are needed, 1/8 = 1, 2/8 = 1, 4/8 = 1, 8/8 = 1, 16/8 = 2
+        self.bpp = PNGImage.TYPE_MULTIPLIER[self.color_type] * math.ceil((self.depth / 8))
 
     @property
     def bitmap(self):
@@ -123,11 +210,61 @@ class PNGImage:
             buffer = []
             i = 0
             while len(buffer) < self.width:
+                # TODO: truecolor-specific
                 r, g, b = self.data[i:i + 3]
                 buffer.append(np.array([r, g, b]))
                 i += 3
             self._bitmap.append(np.array(buffer))
         return np.array(self._bitmap)
+
+    @property
+    def interlaced(self):
+        start_x = {0: 0, 1: 4, 2: 0, 3: 2, 4: 0, 5: 1, 6: 0}
+        start_y = {0: 0, 1: 0, 2: 4, 3: 0, 4: 2, 5: 0, 6: 1}
+        delta_x = {0: 8, 1: 8, 2: 4, 3: 4, 4: 2, 5: 2, 6: 1}
+        delta_y = {0: 8, 1: 8, 2: 8, 3: 4, 4: 4, 5: 2, 6: 2}
+
+        _pass = 0
+        map = [[0] * self.width] * self.height
+        while _pass < 7:
+            y = start_y[_pass]
+            while y < self.height:
+                x = start_x[_pass]
+                max_x = 0
+                while x < self.width:
+                    # XXX: truecolor-specific
+                    normalized = ((y * max_x) + (x * 3))
+                    r, g, b = self.data[normalized:normalized + 3]
+                    map[y][x] = np.array([r, g, b])
+                    x += delta_x[_pass]
+                max_x += (x / delta_x[_pass])
+                y += delta_y[_pass]
+            _pass += 1
+        return np.array([np.array(row for row in map)])
+
+    @property
+    def scanlines(self):
+        x_sub = self.width / 8
+        y_sub = self.width / 8
+        scanlines = defaultdict(bytes)
+        bpss = [
+            1 * x_sub * self.bpp,
+            1 * x_sub * self.bpp,
+            2 * x_sub * self.bpp,
+            2 * x_sub * self.bpp,
+            4 * x_sub * self.bpp,
+            4 * x_sub * self.bpp,
+            8 * x_sub * self.bpp,
+        ]
+
+        for i, bps in enumerate(bpss):
+            start = 0
+            while start < y_sub:
+                # take into account the filter_type byte
+                end = start + int(bps) + 1
+                scanlines[i] += self.data[start:end]
+                start = end
+        return scanlines
 
 
 if __name__ == '__main__':
@@ -138,10 +275,11 @@ if __name__ == '__main__':
     d = PNGDecoder(buf)
     d.decode()
     d.inflate()
+    d.defilter()
     img = d.image
     pygame.init()
     screen = pygame.display.set_mode((img.width, img.height))
-    pygame.surfarray.blit_array(screen, img.bitmap)
+    pygame.surfarray.blit_array(screen, img.interlaced)
     pygame.display.flip()
     while True:
         pass
